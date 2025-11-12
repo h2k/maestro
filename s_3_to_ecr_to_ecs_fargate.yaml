@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Server-side pipeline to move a Docker image TAR from S3 -> ECR -> run on ECS/Fargate.
+  Creates: ECR repo, CodeBuild job to import TAR from S3 and push to ECR, ECS Cluster,
+  Task Definition, Fargate Service (public IP optional). No local downloads required.
+
+Parameters:
+  RepoName:
+    Type: String
+    Default: my-app
+    Description: ECR repository name to create/use.
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Tag to assign to the imported image in ECR.
+  SourceBucket:
+    Type: String
+    Description: S3 bucket that contains the Docker image TAR (e.g., my-bucket)
+  SourceKey:
+    Type: String
+    Description: S3 object key for the TAR (e.g., exports/my-app.tar)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to run the Fargate service.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in the VPC for ECS tasks.
+  AssignPublicIp:
+    Type: String
+    AllowedValues: [ENABLED, DISABLED]
+    Default: ENABLED
+    Description: Whether to assign a public IP to the Fargate tasks.
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: Container port to expose.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  FargateCpu:
+    Type: String
+    AllowedValues: ['256', '512', '1024', '2048', '4096']
+    Default: '256'
+  FargateMemory:
+    Type: String
+    AllowedValues: ['512', '1024', '2048', '3072', '4096', '5120', '6144', '8192', '16384', '30720']
+    Default: '512'
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+  BuildComputeType:
+    Type: String
+    AllowedValues: [BUILD_GENERAL1_SMALL, BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE]
+    Default: BUILD_GENERAL1_SMALL
+  BuildImage:
+    Type: String
+    Default: aws/codebuild/standard:7.0
+    Description: CodeBuild Linux image (Docker-in-Docker supported when PrivilegedMode=true)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Image Source (S3)" }
+        Parameters: [SourceBucket, SourceKey, RepoName, ImageTag]
+      - Label: { default: "ECS/Fargate" }
+        Parameters: [VpcId, SubnetIds, AssignPublicIp, ContainerPort, DesiredCount, FargateCpu, FargateMemory]
+      - Label: { default: "Logs & Build" }
+        Parameters: [LogRetentionDays, BuildComputeType, BuildImage]
+
+Resources:
+  #### ECR ####
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepoName
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  #### CloudWatch Logs ####
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${RepoName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  #### IAM for CodeBuild ####
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: CodeBuildS3Ecr
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SourceBucket}/${SourceKey}
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  #### CodeBuild project that imports TAR -> ECR ####
+  ImportImageProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-ImportImage"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: !Ref BuildComputeType
+        Image: !Ref BuildImage
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true   # needed for docker load/push
+        EnvironmentVariables:
+          - Name: REPO
+            Value: !Ref RepoName
+          - Name: TAG
+            Value: !Ref ImageTag
+          - Name: S3_BUCKET
+            Value: !Ref SourceBucket
+          - Name: S3_KEY
+            Value: !Ref SourceKey
+          - Name: ACCOUNT_ID
+            Value: !Sub "${AWS::AccountId}"
+          - Name: REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to ECR ${ACCOUNT_ID} in ${REGION}"
+                - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
+                - echo "Downloading image TAR from s3://$S3_BUCKET/$S3_KEY"
+                - aws s3 cp s3://$S3_BUCKET/$S3_KEY /tmp/image.tar
+            build:
+              commands:
+                - echo "Loading TAR into Docker cache"
+                - docker load -i /tmp/image.tar
+                - echo "Listing loaded images (for debug)"
+                - docker images
+                - |
+                  IMAGE_ID=$(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | head -n1 | awk '{print $2}')
+                  if [ -z "$IMAGE_ID" ]; then echo "No image ID found after docker load"; exit 1; fi
+                - echo "Tagging image as ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}"
+                - |
+                  LOADED_REPO_TAG=$(docker images --format '{{.Repository}}:{{.Tag}}' | head -n1)
+                  docker tag "$LOADED_REPO_TAG" ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}
+                - echo "Pushing to ECR"
+                - docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}
+          artifacts:
+            files: []
+
+  #### Lambda custom resource to run the CodeBuild job and wait ####
+  ImportTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: LambdaStartCodeBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ImportImageProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ImportTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ImportTriggerRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json, time, boto3, cfnresponse
+          cb = boto3.client('codebuild')
+
+          def run_and_wait(project_name):
+              start = cb.start_build(projectName=project_name)
+              bid = start['build']['id']
+              while True:
+                  time.sleep(5)
+                  res = cb.batch_get_builds(ids=[bid])
+                  b = res['builds'][0]
+                  if b['buildStatus'] in ('SUCCEEDED','FAILED','FAULT','TIMED_OUT','STOPPED'): return b['buildStatus']
+
+          def handler(event, context):
+              try:
+                  project = event['ResourceProperties']['ProjectName']
+                  if event['RequestType'] in ('Create','Update'):
+                      status = run_and_wait(project)
+                      if status=='SUCCEEDED':
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': status})
+                      else:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {'Status': status})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'NoOp'})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # cfnresponse helper layer (inline)
+  ImportTriggerLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      Content:
+        ZipFile: |
+          import json, urllib3
+          http = urllib3.PoolManager()
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False):
+              responseUrl = event['ResponseURL']
+              responseBody = {
+                'Status': responseStatus,
+                'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                'PhysicalResourceId': physicalResourceId or context.log_stream_name,
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'NoEcho': noEcho,
+                'Data': responseData
+              }
+              json_responseBody = json.dumps(responseBody)
+              headers = { 'content-type' : '', 'content-length' : str(len(json_responseBody)) }
+              http.request('PUT', responseUrl, body=json_responseBody, headers=headers)
+
+  ImportTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImportTriggerFunction
+      Principal: cloudformation.amazonaws.com
+
+  ImportInvoker:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ImportTriggerFunction.Arn
+      ProjectName: !Ref ImportImageProject
+    DependsOn:
+      - EcrRepository
+
+  #### ECS Cluster & Roles ####
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: ECSExecPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  #### Task Definition & Service ####
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: ImportInvoker
+    Properties:
+      Family: !Sub "${RepoName}-task"
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref FargateCpu
+      Memory: !Ref FargateMemory
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref RepoName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}:${ImageTag}"
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to Fargate service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: TaskDefinition
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: !Ref SubnetIds
+      TaskDefinition: !Ref TaskDefinition
+
+Outputs:
+  RepositoryUri:
+    Description: ECR Repository URI
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}"
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+  ServiceArn:
+    Description: ECS Service ARN
+    Value: !Ref ECSService
